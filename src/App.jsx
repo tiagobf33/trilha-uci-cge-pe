@@ -7,73 +7,14 @@ import {
   PolarRadiusAxis,
   ResponsiveContainer,
   Tooltip,
+  LineChart,
+  Line,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  BarChart,
+  Bar,
 } from "recharts";
-import { initializeApp } from "firebase/app";
-import {
-  getFirestore,
-  collection,
-  doc,
-  setDoc,
-  getDocs,
-} from "firebase/firestore";
-import { firebaseConfig } from "./firebaseConfig";
-
-// ---------------------------------------------------------------------------
-// CAMADA DE STORAGE — Firebase Firestore
-// Implementa a mesma API (get/set/list) que o restante do código já usa,
-// mas agora gravando de verdade em um banco compartilhado na nuvem.
-// Qualquer pessoa que abrir este app, de qualquer computador, grava e lê
-// do mesmo banco — o que faz o Painel CGE funcionar com dados reais de
-// todas as UCIs.
-// ---------------------------------------------------------------------------
-const firebaseApp = initializeApp(firebaseConfig);
-const db = getFirestore(firebaseApp);
-const COLECAO = "uci_trilha_diagnosticos";
-
-if (typeof window !== "undefined") {
-  window.storage = {
-    async set(key, value) {
-      try {
-        await setDoc(doc(db, COLECAO, key), { value, savedAt: Date.now() });
-        return { key, value };
-      } catch (e) {
-        console.error("Erro ao salvar no Firestore:", e);
-        return null;
-      }
-    },
-    async get(key) {
-      // não utilizado pelo restante do código nesta versão, mantido por
-      // compatibilidade de API.
-      throw new Error("get individual não implementado — use list");
-    },
-    async list(prefix = "") {
-      const snap = await getDocs(collection(db, COLECAO));
-      const keys = [];
-      snap.forEach((d) => {
-        if (d.id.startsWith(prefix)) keys.push(d.id);
-      });
-      return { keys, _docs: snap };
-    },
-  };
-}
-
-// Helper usado pelo Painel: lê todos os documentos da coleção de uma vez,
-// já parseando o JSON salvo em cada um.
-async function listarTodosDiagnosticos() {
-  const snap = await getDocs(collection(db, COLECAO));
-  const itens = [];
-  snap.forEach((d) => {
-    const data = d.data();
-    if (data && data.value) {
-      try {
-        itens.push(JSON.parse(data.value));
-      } catch (_) {
-        // ignora documento corrompido
-      }
-    }
-  });
-  return itens;
-}
 
 // ---------------------------------------------------------------------------
 // DADOS DO MODELO
@@ -291,10 +232,17 @@ export default function TrilhaUCI() {
   const [respM1, setRespM1] = useState({}); // { "t1-0": valorBruto(0..4) }
   const [respM2, setRespM2] = useState({}); // { t1: 0..4 }
   const [respM3, setRespM3] = useState({}); // { "t1-teorico": 0..4, "t1-pratico": 0..4 }
-  const [identificacao, setIdentificacao] = useState({ orgao: "", respondente: "", funcao: "" });
+  const [identificacao, setIdentificacao] = useState({ orgao: "", respondente: "", funcao: "", email: "" });
   const [salvando, setSalvando] = useState(false);
   const [erroSalvar, setErroSalvar] = useState(false);
   const [jaSalvou, setJaSalvou] = useState(false);
+
+  // Sempre que a tela muda (ex: Módulo 2 → Módulo 3, ou Módulo 3 → Resultado),
+  // volta o scroll para o topo — sem isso, a nova tela abre na mesma posição
+  // de rolagem em que a tela anterior estava, parecendo "cortada por cima".
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [tela]);
 
   // -------------------- progresso --------------------
   const totalM1 = TEMAS.length * 3;
@@ -363,17 +311,43 @@ export default function TrilhaUCI() {
     full: 5,
   }));
 
+  // ICI — Indicador de Conhecimento de Controle Interno: média do conhecimento
+  // por tema, ponderada pela relevância daquele tema (Ambiente + Exigência).
+  // Temas mais demandados pesam mais; conhecimento em temas de baixa demanda
+  // quase não move o indicador.
+  const ici = useMemo(() => {
+    let somaPesos = 0;
+    let somaPonderada = 0;
+    resultados.forEach((r) => {
+      const peso = r.ambiente + r.exigencia;
+      somaPesos += peso;
+      somaPonderada += peso * r.conhecimento;
+    });
+    return somaPesos ? Number((somaPonderada / somaPesos).toFixed(2)) : 0;
+  }, [resultados]);
+
   // -------------------- salvar no storage compartilhado --------------------
   const salvarResultado = async () => {
     if (jaSalvou || salvando) return;
     setSalvando(true);
     setErroSalvar(false);
     try {
+      const emailDigitado = identificacao.email.trim().toLowerCase();
+      if (emailDigitado === EMAIL_DEMO) {
+        await gerarHistoricoDemo({
+          nome: identificacao.respondente,
+          orgao: identificacao.orgao,
+          funcao: identificacao.funcao,
+        });
+      }
       const registro = {
         orgao: identificacao.orgao.trim(),
         respondente: identificacao.respondente.trim(),
+        email: emailDigitado,
         funcao: identificacao.funcao.trim(),
         dataISO: new Date().toISOString(),
+        ano: new Date().getFullYear(),
+        ici: ici,
         resultados: resultados.map((r) => ({
           id: r.id,
           nome: r.nome,
@@ -469,11 +443,13 @@ export default function TrilhaUCI() {
             jaSalvou={jaSalvou}
             erroSalvar={erroSalvar}
             onTentarSalvarNovamente={salvarResultado}
+            ici={ici}
+            identificacao={identificacao}
             onReiniciar={() => {
               setRespM1({});
               setRespM2({});
               setRespM3({});
-              setIdentificacao({ orgao: "", respondente: "", funcao: "" });
+              setIdentificacao({ orgao: "", respondente: "", funcao: "", email: "" });
               setJaSalvou(false);
               setErroSalvar(false);
               setTela("intro");
@@ -589,7 +565,8 @@ function Identificacao({ valores, onChange, onAvançar }) {
   const completo =
     valores.orgao.trim().length > 1 &&
     valores.respondente.trim().length > 1 &&
-    valores.funcao.trim().length > 1;
+    valores.funcao.trim().length > 1 &&
+    valores.email.trim().length > 3;
   return (
     <div style={styles.identWrap}>
       <div style={styles.introEyebrow}>Antes de começar</div>
@@ -624,6 +601,20 @@ function Identificacao({ valores, onChange, onAvançar }) {
       </label>
 
       <label style={styles.identLabel}>
+        Seu e-mail
+        <input
+          type="email"
+          value={valores.email}
+          onChange={(e) => onChange({ ...valores, email: e.target.value })}
+          placeholder="Ex.: maria.silva@gmail.com"
+          style={styles.identInput}
+        />
+      </label>
+      <p style={styles.identNotaEmail}>
+        O e-mail identifica seus diagnósticos de um ano para o outro, para montar seu histórico de evolução.
+      </p>
+
+      <label style={styles.identLabel}>
         Função na UCI
         <select
           value={valores.funcao}
@@ -640,6 +631,63 @@ function Identificacao({ valores, onChange, onAvançar }) {
       <Avançar disabled={!completo} onClick={onAvançar} label="Começar Módulo I →" />
     </div>
   );
+}
+
+// E-mail especial que, ao ser usado, dispara a geração automática de 4 anos
+// fictícios (2022-2025) de histórico antes do diagnóstico real ser salvo —
+// usado apenas para demonstrações/apresentações.
+const EMAIL_DEMO = "demo@cge.pe.gov.br";
+
+async function gerarHistoricoDemo({ nome, orgao, funcao }) {
+  // Trajetória fictícia: criticidade cai e conhecimento sobe ano a ano,
+  // contando uma história de evolução ao longo de 4 ciclos anteriores.
+  const anos = [2022, 2023, 2024, 2025];
+  const fatorPorAno = [1.0, 0.85, 0.68, 0.5]; // multiplicador de criticidade
+
+  for (let i = 0; i < anos.length; i++) {
+    const ano = anos[i];
+    const fator = fatorPorAno[i];
+    const resultadosFicticios = TEMAS.map((t, idx) => {
+      const base = 3 + ((idx * 0.13) % 1.8); // varia a base por tema
+      const ambiente = Number(Math.min(5, Math.max(1, base * fator + 0.6)).toFixed(2));
+      const exigencia = Number(Math.min(5, Math.max(1, base * fator + 0.3)).toFixed(2));
+      const conhecimento = Number(Math.min(5, Math.max(1, 1.8 + (1 - fator) * 3.4)).toFixed(2));
+      const gapConhecimento = Number((6 - conhecimento).toFixed(2));
+      const criticidade = Number(((ambiente + exigencia + gapConhecimento) / 3).toFixed(2));
+      return {
+        id: t.id,
+        nome: t.nome,
+        ambiente,
+        exigencia,
+        conhecimento,
+        gapConhecimento,
+        criticidade,
+      };
+    });
+
+    let somaPesos = 0;
+    let somaPonderada = 0;
+    resultadosFicticios.forEach((r) => {
+      const peso = r.ambiente + r.exigencia;
+      somaPesos += peso;
+      somaPonderada += peso * r.conhecimento;
+    });
+    const iciAno = Number((somaPonderada / somaPesos).toFixed(2));
+
+    const registro = {
+      orgao: orgao || "Secretaria de Educação",
+      respondente: nome.trim(),
+      email: EMAIL_DEMO,
+      funcao: funcao || "Titular",
+      dataISO: new Date(`${ano}-06-15T12:00:00`).toISOString(),
+      ano,
+      ici: iciAno,
+      resultados: resultadosFicticios,
+      demonstracao: true,
+    };
+    const chave = `diagnostico:demo:${ano}:${Math.random().toString(36).slice(2, 8)}`;
+    await window.storage.set(chave, JSON.stringify(registro), true);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -953,7 +1001,148 @@ function TrilhaDeEstudo({ resultados }) {
   );
 }
 
-function Resultado({ resultados, radarData, onVoltar, onReiniciar, salvando, jaSalvou, erroSalvar, onTentarSalvarNovamente }) {
+// ---------------------------------------------------------------------------
+// ANÁLISE DE HISTÓRICO — evolução do ICI e da criticidade ao longo dos anos
+// ---------------------------------------------------------------------------
+function AnaliseHistorico({ respondente, email, resultadosAtuais, iciAtual }) {
+  const [carregando, setCarregando] = useState(true);
+  const [historico, setHistorico] = useState([]);
+  const [erro, setErro] = useState(false);
+
+  useEffect(() => {
+    let ativo = true;
+    async function carregar() {
+      const emailBusca = (email || "").trim().toLowerCase();
+      if (!emailBusca) {
+        setCarregando(false);
+        return;
+      }
+      setCarregando(true);
+      setErro(false);
+      try {
+        const lista = await window.storage.list("diagnostico:", true);
+        const chaves = (lista && lista.keys) || [];
+        const itens = [];
+        for (const k of chaves) {
+          try {
+            const r = await window.storage.get(k, true);
+            if (r && r.value) {
+              const reg = JSON.parse(r.value);
+              if (reg.email && reg.email.trim().toLowerCase() === emailBusca) {
+                itens.push(reg);
+              }
+            }
+          } catch (_) {
+            // ignora item corrompido
+          }
+        }
+        itens.sort((a, b) => (a.ano || 0) - (b.ano || 0) || new Date(a.dataISO) - new Date(b.dataISO));
+        if (ativo) setHistorico(itens);
+      } catch (e) {
+        if (ativo) setErro(true);
+      } finally {
+        if (ativo) setCarregando(false);
+      }
+    }
+    carregar();
+    return () => { ativo = false; };
+  }, [email]);
+
+  if (carregando || erro || historico.length < 2) return null;
+
+  const primeiro = historico[0];
+  const ultimo = historico[historico.length - 1];
+
+  const seriesICI = historico.map((h) => ({
+    ano: String(h.ano || "—"),
+    ici: typeof h.ici === "number" ? h.ici : null,
+  })).filter((p) => p.ici !== null);
+
+  const deltaICI = ultimo.ici != null && primeiro.ici != null
+    ? Number((ultimo.ici - primeiro.ici).toFixed(2))
+    : null;
+
+  const criticosAgora = resultadosAtuais.filter((r) => faixaDe(r.criticidade).nome === "Crítico" || faixaDe(r.criticidade).nome === "Alto").length;
+  const criticosPrimeiro = (primeiro.resultados || []).filter((r) => faixaDe(r.criticidade).nome === "Crítico" || faixaDe(r.criticidade).nome === "Alto").length;
+  const deltaCriticos = criticosAgora - criticosPrimeiro;
+
+  const comparativoTemas = resultadosAtuais.map((atual) => {
+    const inicial = (primeiro.resultados || []).find((r) => r.id === atual.id);
+    return {
+      tema: atual.curto,
+      inicial: inicial ? inicial.criticidade : null,
+      atual: atual.criticidade,
+    };
+  }).filter((t) => t.inicial !== null);
+
+  return (
+    <div style={styles.historicoWrap}>
+      <div style={styles.historicoHeader}>
+        <h3 style={styles.historicoTitulo}>Análise de histórico</h3>
+        <p style={styles.historicoSub}>
+          {historico.length}º preenchimento de {respondente} · primeiro registro em {primeiro.ano || "—"}
+        </p>
+      </div>
+
+      <div style={styles.historicoMetricas}>
+        <div style={styles.metricaCard}>
+          <div style={styles.metricaLabel}>ICI atual</div>
+          <div style={styles.metricaValor}>{iciAtual}</div>
+          {deltaICI !== null && (
+            <div style={{ ...styles.metricaDelta, color: deltaICI >= 0 ? colors.accentDeep : colors.critico }}>
+              {deltaICI >= 0 ? "+" : ""}{deltaICI} desde {primeiro.ano}
+            </div>
+          )}
+        </div>
+        <div style={styles.metricaCard}>
+          <div style={styles.metricaLabel}>Temas críticos/altos</div>
+          <div style={styles.metricaValor}>{criticosAgora}</div>
+          <div style={{ ...styles.metricaDelta, color: deltaCriticos <= 0 ? colors.accentDeep : colors.critico }}>
+            {deltaCriticos > 0 ? "+" : ""}{deltaCriticos} desde {primeiro.ano}
+          </div>
+        </div>
+        <div style={styles.metricaCard}>
+          <div style={styles.metricaLabel}>Preenchimentos registrados</div>
+          <div style={styles.metricaValor}>{historico.length}</div>
+          <div style={styles.metricaDeltaNeutro}>{primeiro.ano} – {ultimo.ano}</div>
+        </div>
+      </div>
+
+      <div style={styles.historicoGraficoBloco}>
+        <div style={styles.historicoGraficoLabel}>Evolução do ICI</div>
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={seriesICI} margin={{ top: 10, right: 16, left: -16, bottom: 0 }}>
+            <CartesianGrid stroke="#E2E6EA" vertical={false} />
+            <XAxis dataKey="ano" tick={{ fill: "#5b6b85", fontSize: 12 }} axisLine={{ stroke: "#E2E6EA" }} tickLine={false} />
+            <YAxis domain={[0, 5]} tick={{ fill: "#9fb3c8", fontSize: 11 }} axisLine={false} tickLine={false} />
+            <Tooltip formatter={(v) => [v, "ICI"]} contentStyle={{ fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 12, borderRadius: 8 }} />
+            <Line type="monotone" dataKey="ici" stroke={colors.accentDeep} strokeWidth={2} dot={{ r: 4, fill: colors.accentDeep }} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div style={styles.historicoGraficoBloco}>
+        <div style={styles.historicoGraficoLabel}>Criticidade por tema — {primeiro.ano} vs. {ultimo.ano}</div>
+        <ResponsiveContainer width="100%" height={Math.max(240, comparativoTemas.length * 28)}>
+          <BarChart data={comparativoTemas} layout="vertical" margin={{ top: 4, right: 16, left: 8, bottom: 0 }}>
+            <CartesianGrid stroke="#E2E6EA" horizontal={false} />
+            <XAxis type="number" domain={[0, 5]} tick={{ fill: "#9fb3c8", fontSize: 11 }} axisLine={{ stroke: "#E2E6EA" }} tickLine={false} />
+            <YAxis type="category" dataKey="tema" width={110} tick={{ fill: "#0B2545", fontSize: 11.5 }} axisLine={false} tickLine={false} />
+            <Tooltip contentStyle={{ fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 12, borderRadius: 8 }} />
+            <Bar dataKey="inicial" name={String(primeiro.ano)} fill="#D85A30" radius={[0, 3, 3, 0]} barSize={9} />
+            <Bar dataKey="atual" name={String(ultimo.ano)} fill={colors.accentDeep} radius={[0, 3, 3, 0]} barSize={9} />
+          </BarChart>
+        </ResponsiveContainer>
+        <div style={styles.historicoLegenda}>
+          <span style={styles.historicoLegendaItem}><span style={{ ...styles.historicoLegendaDot, background: "#D85A30" }} />{primeiro.ano}</span>
+          <span style={styles.historicoLegendaItem}><span style={{ ...styles.historicoLegendaDot, background: colors.accentDeep }} />{ultimo.ano}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Resultado({ resultados, radarData, onVoltar, onReiniciar, salvando, jaSalvou, erroSalvar, onTentarSalvarNovamente, ici, identificacao }) {
   const porFaixa = FAIXAS.map((f) => ({
     ...f,
     itens: resultados.filter((r) => faixaDe(r.criticidade).nome === f.nome),
@@ -1048,6 +1237,13 @@ function Resultado({ resultados, radarData, onVoltar, onReiniciar, salvando, jaS
       </div>
 
       <TrilhaDeEstudo resultados={resultados} />
+
+      <AnaliseHistorico
+        respondente={identificacao.respondente}
+        email={identificacao.email}
+        resultadosAtuais={resultados}
+        iciAtual={ici}
+      />
 
       <details style={styles.detalheTecnico}>
         <summary style={styles.detalheSummary}>Ver tabela completa de cálculo por tema</summary>
@@ -1149,10 +1345,19 @@ function PainelConteudo({ onSair }) {
       setCarregando(true);
       setErro(false);
       try {
-        const itens = await listarTodosDiagnosticos();
+        const lista = await window.storage.list("diagnostico:", true);
+        const chaves = (lista && lista.keys) || [];
+        const itens = [];
+        for (const k of chaves) {
+          try {
+            const r = await window.storage.get(k, true);
+            if (r && r.value) itens.push(JSON.parse(r.value));
+          } catch (_) {
+            // ignora item corrompido
+          }
+        }
         if (ativo) setRegistros(itens);
       } catch (e) {
-        console.error("Erro ao carregar diagnósticos:", e);
         if (ativo) setErro(true);
       } finally {
         if (ativo) setCarregando(false);
@@ -1479,6 +1684,8 @@ const styles = {
     color: colors.ink, outline: "none", background: "#fff", appearance: "auto",
   },
 
+  identNotaEmail: { fontSize: 12, color: "#9fb3c8", margin: "-10px 0 18px", lineHeight: 1.4 },
+
   painelLinkDiscreto: {
     display: "block", margin: "0 auto 40px", background: "transparent", border: "none",
     color: "#C7CDD6", fontSize: 11.5, textDecoration: "underline", padding: 8,
@@ -1586,6 +1793,22 @@ const styles = {
   },
   trilhaEstudoItemTitulo: { fontSize: 13.5, color: colors.ink, fontWeight: 500, lineHeight: 1.4 },
   trilhaEstudoItemSub: { fontSize: 12, color: "#9fb3c8", marginTop: 2 },
+
+  historicoWrap: { marginBottom: 32, paddingTop: 8, borderTop: `1px solid ${colors.line}` },
+  historicoHeader: { margin: "20px 0 16px" },
+  historicoTitulo: { fontFamily: "'IBM Plex Serif', serif", fontSize: 19, fontWeight: 700, color: colors.ink, margin: "0 0 6px" },
+  historicoSub: { fontSize: 12.5, color: colors.inkSoft, margin: 0 },
+  historicoMetricas: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 },
+  metricaCard: { background: "#F2F4F6", borderRadius: 10, padding: "14px 16px" },
+  metricaLabel: { fontSize: 12, color: colors.inkSoft, marginBottom: 6 },
+  metricaValor: { fontSize: 26, fontWeight: 700, color: colors.ink, fontFamily: "'IBM Plex Serif', serif" },
+  metricaDelta: { fontSize: 12, fontWeight: 600, marginTop: 4 },
+  metricaDeltaNeutro: { fontSize: 12, color: "#9fb3c8", marginTop: 4 },
+  historicoGraficoBloco: { background: colors.card, border: `1px solid ${colors.line}`, borderRadius: 12, padding: "18px 16px 10px", marginBottom: 16 },
+  historicoGraficoLabel: { fontSize: 13, fontWeight: 600, color: colors.ink, marginBottom: 8, paddingLeft: 4 },
+  historicoLegenda: { display: "flex", gap: 16, justifyContent: "center", marginTop: 4, marginBottom: 4 },
+  historicoLegendaItem: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: colors.inkSoft },
+  historicoLegendaDot: { width: 9, height: 9, borderRadius: 2 },
 
   detalheTecnico: { marginBottom: 28 },
   detalheSummary: { fontSize: 13, fontWeight: 600, color: colors.inkSoft, cursor: "pointer", padding: "10px 0" },
